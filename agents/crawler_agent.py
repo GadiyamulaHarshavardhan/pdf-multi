@@ -8,6 +8,8 @@ import logging
 import json
 from datetime import datetime
 import time
+from tools.web_tools import WebTools
+from memory.state_manager import global_state_manager
 
 class CrawlerAgent(AutonomousAgent):
     def __init__(self, llm):
@@ -21,12 +23,8 @@ class CrawlerAgent(AutonomousAgent):
         self.pdf_urls: List[str] = []
         self.web_tools = WebTools()
         
-        # Available crawling engines
-        self.crawling_engines = {
-            'beautifulsoup': BeautifulSoupCrawler(),
-            'selenium': SeleniumCrawler(),
-            'playwright': PlaywrightCrawler()
-        }
+        # Memory management
+        self.state_manager = global_state_manager
     
     async def _analyze_problem(self, context: Dict) -> Dict:
         """Analyze the crawling task and requirements"""
@@ -48,7 +46,7 @@ class CrawlerAgent(AutonomousAgent):
         max_depth = analysis.get('max_depth', 2)
         
         # Determine initial engine based on URL pattern
-        initial_engine = self._suggest_initial_engine(target_url)
+        initial_engine = await self._suggest_initial_engine(target_url)
         
         return {
             "strategy": "adaptive_crawling",
@@ -141,7 +139,7 @@ class CrawlerAgent(AutonomousAgent):
         if "404" in error_str or "not found" in error_str:
             self.log_action("adapt_strategy", {"action": "skip_broken_links"}, "broken_links_found")
     
-    def _suggest_initial_engine(self, url: str) -> str:
+    async def _suggest_initial_engine(self, url: str) -> str:
         """Suggest initial crawling engine based on URL patterns"""
         # Known JavaScript-heavy sites
         js_sites = ['react', 'angular', 'vue', 'spa', 'webpack', 'nextjs']
@@ -155,6 +153,14 @@ class CrawlerAgent(AutonomousAgent):
         if any(pattern in url_lower for pattern in modern_patterns):
             return "playwright"
         
+        # Check if the site has dynamic content
+        try:
+            has_dynamic = await self.web_tools.detect_dynamic_content(url)
+            if has_dynamic:
+                return "playwright"  # Use more modern engine for dynamic content
+        except:
+            pass
+        
         # Default to beautifulsoup for most sites
         return "beautifulsoup"
     
@@ -164,22 +170,22 @@ class CrawlerAgent(AutonomousAgent):
         
         prompt = f"""
         As a Web Crawler Agent, analyze this crawling task:
-        
+
         Target URL: {target_url}
         Max Depth: {context.get('max_depth', 2)}
         Goal: Find PDF files
-        
+
         Available Crawling Engines:
         - BeautifulSoup: Fast for static content, good for simple sites
         - Selenium: Handles JavaScript-heavy sites, real browser automation
         - Playwright: Modern browser automation, handles SPAs and dynamic content
-        
+
         Please provide:
         1. Which crawling engine to use based on the domain
         2. Potential challenges for this domain
         3. Optimal crawling strategy
         4. PDF detection methods to use
-        
+
         Respond in JSON format:
         {{
             "analysis": {{
@@ -237,18 +243,16 @@ class CrawlerAgent(AutonomousAgent):
     
     async def _crawl_recursive(self, url: str, max_depth: int, current_depth: int, engine: str):
         """Recursive crawling implementation with engine selection"""
-        if current_depth > max_depth or url in self.visited_urls:
+        if current_depth > max_depth or url in self.visited_urls or self.web_tools.is_url_visited(url):
             return
         
         self.visited_urls.add(url)
+        self.web_tools.mark_url_visited(url)
         print(f"🔍 Crawling {url} (depth {current_depth}) with {engine}")
         
         try:
-            # Choose crawling engine based on recommendation
-            crawler = self.crawling_engines.get(engine, self.crawling_engines['beautifulsoup'])
-            
-            # Get page content and links
-            html_content, links = await crawler.crawl_page(url)
+            # Use the smart crawling engine that automatically selects the best method
+            html_content, links = await self.web_tools.smart_crawl(url, engine)
             
             if html_content:
                 # Find PDFs on current page
@@ -288,213 +292,3 @@ class CrawlerAgent(AutonomousAgent):
             return domain1 == domain2
         except:
             return False
-
-# Base Crawler Interface
-class BaseCrawler:
-    async def crawl_page(self, url: str) -> tuple[str, Set[str]]:
-        """Crawl a page and return HTML content and links"""
-        raise NotImplementedError
-
-# BeautifulSoup Crawler (Static Content)
-class BeautifulSoupCrawler(BaseCrawler):
-    def __init__(self):
-        self.session = None
-    
-    async def get_session(self):
-        if not self.session:
-            timeout = aiohttp.ClientTimeout(total=30)
-            self.session = aiohttp.ClientSession(timeout=timeout)
-        return self.session
-    
-    async def close_session(self):
-        if self.session:
-            await self.session.close()
-    
-    async def crawl_page(self, url: str) -> tuple[str, Set[str]]:
-        """Crawl page using BeautifulSoup (static content)"""
-        try:
-            session = await self.get_session()
-            async with session.get(url) as response:
-                if response.status == 200:
-                    html = await response.text()
-                else:
-                    print(f"❌ HTTP {response.status} for {url}")
-                    return "", set()
-            
-            soup = BeautifulSoup(html, 'html.parser')
-            links = set()
-            
-            for link in soup.find_all('a', href=True):
-                href = link['href']
-                full_url = urljoin(url, href)
-                links.add(full_url)
-            
-            return html, links
-            
-        except Exception as e:
-            print(f"BeautifulSoup crawl failed for {url}: {e}")
-            return "", set()
-
-# Selenium Crawler (Dynamic Content)
-class SeleniumCrawler(BaseCrawler):
-    def __init__(self):
-        self.driver = None
-    
-    async def crawl_page(self, url: str) -> tuple[str, Set[str]]:
-        """Crawl page using Selenium (dynamic content)"""
-        try:
-            from selenium import webdriver
-            from selenium.webdriver.chrome.options import Options
-            from selenium.webdriver.common.by import By
-            
-            # Setup Chrome options
-            chrome_options = Options()
-            chrome_options.add_argument("--headless")
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--window-size=1920,1080")
-            
-            # Initialize driver
-            self.driver = webdriver.Chrome(options=chrome_options)
-            self.driver.get(url)
-            
-            # Wait for page to load
-            self.driver.implicitly_wait(10)
-            
-            # Get page source after JavaScript execution
-            html = self.driver.page_source
-            
-            # Extract links
-            links = set()
-            a_tags = self.driver.find_elements(By.TAG_NAME, "a")
-            for a_tag in a_tags:
-                href = a_tag.get_attribute("href")
-                if href:
-                    full_url = urljoin(url, href)
-                    links.add(full_url)
-            
-            return html, links
-            
-        except Exception as e:
-            print(f"Selenium crawl failed for {url}: {e}")
-            return "", set()
-        finally:
-            if self.driver:
-                self.driver.quit()
-                self.driver = None
-
-# Playwright Crawler (Modern Dynamic Content)
-class PlaywrightCrawler(BaseCrawler):
-    def __init__(self):
-        self.browser = None
-        self.context = None
-    
-    async def crawl_page(self, url: str) -> tuple[str, Set[str]]:
-        """Crawl page using Playwright (modern dynamic content)"""
-        try:
-            from playwright.async_api import async_playwright
-            
-            async with async_playwright() as p:
-                # Launch browser
-                self.browser = await p.chromium.launch(headless=True)
-                self.context = await self.browser.new_context(
-                    viewport={'width': 1920, 'height': 1080},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                )
-                
-                # Create page
-                page = await self.context.new_page()
-                
-                # Navigate to URL
-                await page.goto(url, wait_until='networkidle')
-                
-                # Wait for potential dynamic content
-                await page.wait_for_timeout(2000)
-                
-                # Get page content
-                html = await page.content()
-                
-                # Extract links
-                links = set()
-                a_elements = await page.query_selector_all('a')
-                for a_element in a_elements:
-                    href = await a_element.get_attribute('href')
-                    if href:
-                        full_url = urljoin(url, href)
-                        links.add(full_url)
-                
-                # Close page
-                await page.close()
-                
-                return html, links
-                
-        except Exception as e:
-            print(f"Playwright crawl failed for {url}: {e}")
-            return "", set()
-        finally:
-            if self.context:
-                await self.context.close()
-            if self.browser:
-                await self.browser.close()
-
-# Web Tools (Utilities)
-class WebTools:
-    def __init__(self):
-        self.session = None
-    
-    async def get_session(self):
-        if not self.session:
-            timeout = aiohttp.ClientTimeout(total=30)
-            self.session = aiohttp.ClientSession(timeout=timeout)
-        return self.session
-    
-    async def close_session(self):
-        if self.session:
-            await self.session.close()
-    
-    async def fetch_page(self, url: str) -> str:
-        session = await self.get_session()
-        async with session.get(url) as response:
-            return await response.text()
-    
-    def extract_internal_links(self, html: str, base_url: str) -> Set[str]:
-        soup = BeautifulSoup(html, 'html.parser')
-        links = set()
-        base_domain = urlparse(base_url).netloc
-        
-        for link in soup.find_all('a', href=True):
-            href = link['href']
-            full_url = urljoin(base_url, href)
-            if urlparse(full_url).netloc == base_domain:
-                links.add(full_url)
-        
-        return links
-    
-    def filter_pdf_links(self, links: Set[str]) -> List[str]:
-        pdf_links = []
-        for link in links:
-            if link.lower().endswith('.pdf'):
-                pdf_links.append(link)
-            # Also check for PDF in URL parameters
-            elif '.pdf?' in link.lower():
-                pdf_links.append(link)
-        return pdf_links
-    
-    def detect_dynamic_content(self, html: str) -> bool:
-        """Detect if page likely has dynamic content"""
-        indicators = [
-            '<script src=',
-            'react',
-            'angular',
-            'vue',
-            'webpack',
-            'spa',
-            'single page application',
-            'dynamic content',
-            'ajax',
-            'fetch('
-        ]
-        
-        html_lower = html.lower()
-        return any(indicator in html_lower for indicator in indicators)
