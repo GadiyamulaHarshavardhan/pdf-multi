@@ -1,8 +1,11 @@
 langchain
 langchain-community
+langchain-ollama
 langgraph
 crewai
 ollama
+selenium
+playwright
 beautifulsoup4
 requests
 aiohttp
@@ -10,3 +13,6 @@ pypdf
 python-dotenv
 ujson
 asyncio
+memory-profiler
+trio
+trio-websocket
